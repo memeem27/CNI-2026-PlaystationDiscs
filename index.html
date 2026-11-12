@@ -498,20 +498,32 @@
 </div>
 <script>
 (() => {
-  // Add the Firebase web API key and Realtime Database URL to connect the poll.
   const firebaseConfig = { apiKey: "AIzaSyBwmmIIClHqyXBb6m4AcoywHM_Q40Hl8eE", databaseURL: "https://cni-2026-poll-default-rtdb.firebaseio.com" };
   const path = "projectPoll/votes";
-  const removeButton = document.getElementById("poll-remove");
+  const voteKey = "playstation-poll-voted";
+  const userKey = "playstation-poll-user";
+  const lockName = "playstation-project-poll-vote";
   const labels = { support: "I support the change", oppose: "I oppose the change", unsure: "I am unsure" };
-  const form = document.getElementById("poll-form"), status = document.getElementById("poll-status"), button = form.querySelector("button"), results = document.getElementById("poll-results"), list = document.getElementById("poll-results-list"), totalText = document.getElementById("poll-total");
+  const form = document.getElementById("poll-form"), status = document.getElementById("poll-status"), button = form.querySelector("button"), removeButton = document.getElementById("poll-remove"), results = document.getElementById("poll-results"), list = document.getElementById("poll-results-list"), totalText = document.getElementById("poll-total");
   const configured = firebaseConfig.apiKey && /^https:\/\/[a-z0-9.-]+\/?$/i.test(firebaseConfig.databaseURL);
   const url = configured ? firebaseConfig.databaseURL.replace(/\/$/, "") + "/" + path : "";
   if (!configured) { status.textContent = "The poll is not connected yet."; button.disabled = true; return; }
+
+  async function pollFetch(target, options = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    try { return await fetch(target, {...options, signal:controller.signal}); }
+    finally { clearTimeout(timer); }
+  }
+
+  let resultRequest = 0;
   async function showResults() {
-    const response = await fetch(url + ".json", {cache:"no-store"});
+    const requestNumber = ++resultRequest;
+    const response = await pollFetch(url + ".json", {cache:"no-store"});
     if (!response.ok) throw new Error("Could not load results");
     const votes = await response.json(), counts = {support:0, oppose:0, unsure:0};
     Object.values(votes || {}).forEach(v => { if (Object.hasOwn(counts, v)) counts[v]++; });
+    if (requestNumber !== resultRequest) return;
     const total = Object.values(counts).reduce((a,b) => a+b, 0);
     list.replaceChildren();
     Object.entries(labels).forEach(([key,label]) => {
@@ -526,41 +538,155 @@
     });
     totalText.textContent = total + (total === 1 ? " response" : " responses"); results.hidden = false;
   }
-  showResults().catch(() => { status.textContent = "Results are unavailable right now."; });
-  if (localStorage.getItem("playstation-poll-voted") === "yes") { button.disabled = true; status.textContent = "Your vote has been submitted on this browser."; }
-  if (localStorage.getItem("playstation-poll-user")) removeButton.hidden = false;
-  removeButton.addEventListener("click", async () => {
-    removeButton.disabled = true; status.textContent = "Removing your answer…";
+
+  // A vote must be recoverable on this browser if a tab closes mid-submit.
+  try {
+    const probe = "playstation-poll-storage-check";
+    localStorage.setItem(probe, "ok");
+    localStorage.removeItem(probe);
+  } catch (_) {
+    button.disabled = true;
+    status.textContent = "Allow saved browser data to vote in this poll.";
+    showResults().catch(() => {});
+    return;
+  }
+
+  const canLock = !!(navigator.locks && typeof navigator.locks.request === "function");
+  let busy = false;
+  function hasVoted() { return localStorage.getItem(voteKey) === "yes"; }
+  function savedUser() {
     try {
-      const stored = JSON.parse(localStorage.getItem("playstation-poll-user"));
-      if (!stored || !stored.refreshToken || !stored.uid) throw new Error("Missing vote credentials");
-      const refresh = await fetch("https://securetoken.googleapis.com/v1/token?key=" + encodeURIComponent(firebaseConfig.apiKey), {method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"refresh_token",refresh_token:stored.refreshToken})});
-      if (!refresh.ok) throw new Error("Sign-in failed");
-      const token = await refresh.json();
-      const response = await fetch(url + "/" + encodeURIComponent(stored.uid) + ".json?auth=" + encodeURIComponent(token.id_token), {method:"DELETE"});
-      if (!response.ok) throw new Error("Remove failed");
-      localStorage.removeItem("playstation-poll-user"); localStorage.removeItem("playstation-poll-voted");
-      removeButton.hidden = true; button.disabled = false; form.reset(); status.textContent = "Your answer was removed.";
-      try { await showResults(); } catch (_) { status.textContent = "Your answer was removed, but results could not be loaded."; }
-    } catch (_) { status.textContent = "Your answer could not be removed. Please try again."; }
-    removeButton.disabled = false;
+      const user = JSON.parse(localStorage.getItem(userKey));
+      return user && typeof user.uid === "string" && user.uid && typeof user.refreshToken === "string" && user.refreshToken ? user : null;
+    } catch (_) { return null; }
+  }
+  function updateControls(message) {
+    const voted = hasVoted();
+    button.disabled = busy || voted || !canLock;
+    removeButton.hidden = !voted || !savedUser();
+    removeButton.disabled = busy || !canLock;
+    if (message !== undefined) status.textContent = message;
+    else if (!canLock) status.textContent = "Open this page in an up-to-date browser to vote safely.";
+    else status.textContent = voted ? "Your vote has been submitted on this browser." : "";
+  }
+  function refreshResults() {
+    showResults().catch(() => {
+      if (!busy && !hasVoted() && !status.textContent) status.textContent = "Results are unavailable right now.";
+    });
+  }
+  async function readSavedVote(uid) {
+    const response = await pollFetch(url + "/" + encodeURIComponent(uid) + ".json", {cache:"no-store"});
+    if (!response.ok) throw new Error("Could not check your previous vote");
+    const value = await response.json();
+    if (value !== null && !Object.hasOwn(labels, value)) throw new Error("Unexpected saved vote");
+    return value;
+  }
+  async function refreshUser(user) {
+    const response = await pollFetch("https://securetoken.googleapis.com/v1/token?key=" + encodeURIComponent(firebaseConfig.apiKey), {method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"refresh_token",refresh_token:user.refreshToken})});
+    if (!response.ok) throw new Error("Sign-in failed");
+    const token = await response.json();
+    if (!token.id_token || (token.user_id && token.user_id !== user.uid)) throw new Error("Invalid sign-in");
+    return token.id_token;
+  }
+  async function withVoteLock(action) {
+    if (!canLock) throw new Error("Browser cannot coordinate poll tabs");
+    return navigator.locks.request(lockName, action);
+  }
+
+  // Keep already-open copies updated after a vote or removal in another tab.
+  window.addEventListener("storage", event => {
+    if (event.key !== voteKey && event.key !== userKey && event.key !== null) return;
+    if (event.key === voteKey || event.key === null) {
+      if (!hasVoted()) form.reset();
+      if (!busy) updateControls(hasVoted() ? undefined : "Your answer was removed. You can vote again.");
+      refreshResults();
+    } else if (!busy) updateControls();
   });
-  form.addEventListener("submit", async event => {
-    event.preventDefault(); const answer = new FormData(form).get("answer");
-    if (!Object.hasOwn(labels, answer)) return;
-    button.disabled = true; status.textContent = "Submitting your vote…";
+
+  updateControls();
+  refreshResults();
+
+  // Recover a saved vote if the previous tab closed before showing confirmation.
+  async function recoverVote() {
+    if (!canLock || hasVoted() || !savedUser()) return;
+    busy = true; updateControls("Checking your previous vote…");
     try {
-      const auth = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" + encodeURIComponent(firebaseConfig.apiKey), {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({returnSecureToken:true})});
-      if (!auth.ok) throw new Error("Sign-in failed");
-      const user = await auth.json();
-      const response = await fetch(url + "/" + encodeURIComponent(user.localId) + ".json?auth=" + encodeURIComponent(user.idToken), {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(answer)});
-      if (!response.ok) throw new Error("Vote failed");
-      localStorage.setItem("playstation-poll-user", JSON.stringify({uid:user.localId, refreshToken:user.refreshToken}));
-      localStorage.setItem("playstation-poll-voted", "yes");
-      removeButton.hidden = false;
-      status.textContent = "Thank you for voting.";
-      try { await showResults(); } catch (_) { status.textContent = "Your vote was saved, but results could not be loaded."; }
-    } catch (_) { button.disabled = false; status.textContent = "Your vote could not be submitted. Please check your connection and try again."; }
+      await withVoteLock(async () => {
+        const user = savedUser();
+        if (!hasVoted() && user && await readSavedVote(user.uid) !== null) localStorage.setItem(voteKey, "yes");
+      });
+      busy = false; updateControls();
+      refreshResults();
+    } catch (_) {
+      busy = false; updateControls("Your previous vote could not be checked. Please try again.");
+    }
+  }
+  recoverVote();
+
+  removeButton.addEventListener("click", async () => {
+    if (busy || !canLock) return;
+    busy = true; updateControls("Removing your answer…");
+    try {
+      await withVoteLock(async () => {
+        const stored = savedUser();
+        if (!stored) {
+          if (!hasVoted()) return;
+          throw new Error("Missing vote credentials");
+        }
+        const token = await refreshUser(stored);
+        const response = await pollFetch(url + "/" + encodeURIComponent(stored.uid) + ".json?auth=" + encodeURIComponent(token), {method:"DELETE"});
+        if (!response.ok) throw new Error("Remove failed");
+        localStorage.removeItem(userKey);
+        localStorage.removeItem(voteKey);
+      });
+      form.reset();
+      try { await showResults(); } catch (_) {}
+      busy = false;
+      updateControls(hasVoted() ? undefined : "Your answer was removed. You can vote again.");
+    } catch (_) {
+      busy = false; updateControls("Your answer could not be removed. Please try again.");
+    }
+  });
+
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (busy || !canLock) return;
+    const answer = new FormData(form).get("answer");
+    if (!Object.hasOwn(labels, answer)) return;
+    busy = true; updateControls("Submitting your vote…");
+    try {
+      const outcome = await withVoteLock(async () => {
+        if (hasVoted()) return "already";
+        let user = savedUser(), idToken;
+        if (user) {
+          if (await readSavedVote(user.uid) !== null) {
+            localStorage.setItem(voteKey, "yes");
+            return "already";
+          }
+          idToken = await refreshUser(user);
+        } else {
+          const auth = await pollFetch("https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" + encodeURIComponent(firebaseConfig.apiKey), {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({returnSecureToken:true})});
+          if (!auth.ok) throw new Error("Sign-in failed");
+          const account = await auth.json();
+          if (!account.localId || !account.idToken || !account.refreshToken) throw new Error("Invalid sign-in");
+          user = {uid:account.localId, refreshToken:account.refreshToken};
+          idToken = account.idToken;
+          localStorage.setItem(userKey, JSON.stringify(user));
+        }
+        const response = await pollFetch(url + "/" + encodeURIComponent(user.uid) + ".json?auth=" + encodeURIComponent(idToken), {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(answer)});
+        if (!response.ok) throw new Error("Vote failed");
+        localStorage.setItem(voteKey, "yes");
+        return "saved";
+      });
+      let resultsLoaded = true;
+      try { await showResults(); } catch (_) { resultsLoaded = false; }
+      busy = false;
+      if (!hasVoted()) updateControls("Your answer was removed. You can vote again.");
+      else if (!resultsLoaded) updateControls("Your vote was saved, but results could not be loaded.");
+      else updateControls(outcome === "already" ? "Your vote has been submitted on this browser." : "Thank you for voting.");
+    } catch (_) {
+      busy = false; updateControls("Your vote could not be submitted. Please check your connection and try again.");
+    }
   });
 })();
 </script>
